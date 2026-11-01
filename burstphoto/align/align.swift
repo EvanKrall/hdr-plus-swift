@@ -11,7 +11,22 @@ let find_best_tile_alignment_state              = create_pipeline(with_function_
 let warp_texture_bayer_state                    = create_pipeline(with_function_name: "warp_texture_bayer",                     and_label: "Warp Texture (Bayer)")
 let warp_texture_xtrans_state                   = create_pipeline(with_function_name: "warp_texture_xtrans",                    and_label: "Warp Texture (XTrans)")
 
-func align_texture(_ ref_pyramid: [MTLTexture], _ comp_texture: MTLTexture, _ downscale_factor_array: Array<Int>, _ tile_size_array: Array<Int>, _ search_dist_array: Array<Int>, _ uniform_exposure: Bool, _ black_level_mean: Double, _ color_factors3: Array<Double>) -> MTLTexture {
+/// Result of aligning one comparison texture against the reference pyramid.
+/// - aligned_texture: comparison texture warped into the reference frame
+/// - alignment_texture: rg16Sint texture with one texel per tile, storing the tile shift (dx, dy)
+///   in *pyramid level-0 pixels* (level 0 = image downscaled by downscale_factor). To convert a
+///   shift into sensor pixels, multiply by downscale_factor (see warp_texture()).
+/// - tile_info: tile geometry of the finest pyramid level (level 0)
+/// - downscale_factor: downscale_factor_array[0], i.e. the factor between the original texture
+///   and pyramid level 0 (usually the mosaic pattern width)
+struct AlignmentOutput {
+    let aligned_texture: MTLTexture
+    let alignment_texture: MTLTexture
+    let tile_info: TileInfo
+    let downscale_factor: Int
+}
+
+func align_texture_ex(_ ref_pyramid: [MTLTexture], _ comp_texture: MTLTexture, _ downscale_factor_array: Array<Int>, _ tile_size_array: Array<Int>, _ search_dist_array: Array<Int>, _ uniform_exposure: Bool, _ black_level_mean: Double, _ color_factors3: Array<Double>) -> AlignmentOutput {
         
     // initialize tile alignments
     let alignment_descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Sint, width: 1, height: 1, mipmapped: false)
@@ -77,7 +92,16 @@ func align_texture(_ ref_pyramid: [MTLTexture], _ comp_texture: MTLTexture, _ do
     // warp the aligned layer
     let aligned_texture = warp_texture(comp_texture, current_alignment, tile_info, downscale_factor_array[0])
     
-    return aligned_texture
+    return AlignmentOutput(aligned_texture: aligned_texture,
+                           alignment_texture: current_alignment,
+                           tile_info: tile_info,
+                           downscale_factor: downscale_factor_array[0])
+}
+
+/// Convenience wrapper for the regular merging pipeline, which only needs the warped texture.
+func align_texture(_ ref_pyramid: [MTLTexture], _ comp_texture: MTLTexture, _ downscale_factor_array: Array<Int>, _ tile_size_array: Array<Int>, _ search_dist_array: Array<Int>, _ uniform_exposure: Bool, _ black_level_mean: Double, _ color_factors3: Array<Double>) -> MTLTexture {
+    
+    return align_texture_ex(ref_pyramid, comp_texture, downscale_factor_array, tile_size_array, search_dist_array, uniform_exposure, black_level_mean, color_factors3).aligned_texture
 }
 
 

@@ -5,6 +5,43 @@ enum AppState {
     case main, processing, image_saved
 }
 
+// short names of the exposure control and output bit depth settings (as used by perform_denoising)
+let exposure_control_short_names = [
+    " Off"                       : "Off",
+    " Linear (full bit range)"   : "LinearFullRange",
+    " Linear (relative +1 EV)"   : "Linear1EV",
+    " Non-linear (target ±0 EV)" : "Curve0EV",
+    " Non-linear (target +1 EV)" : "Curve1EV",
+]
+let output_bit_depth_short_names = [
+    "Native"          : "Native",
+    "Scale to 16 bit" : "16Bit",
+]
+
+/// Human-readable message for errors thrown by perform_alignment_inspection / perform_denoising.
+func processing_error_message(_ error: Error) -> (title: String, message: String) {
+    switch error {
+    case ImageIOError.load_error:
+        return ("Unsupported format", "Image format not supported. Please only use unprocessed RAW or DNG images. Using RAW images requires Adobe DNG Converter to be installed on your Mac.")
+    case ImageIOError.save_error:
+        return ("Image could not be saved", "The processed image could not be saved for an unknown reason. Sorry.")
+    case AlignmentError.less_than_two_images:
+        return ("Burst required", "Please drag & drop at least 2 images.")
+    case AlignmentError.inconsistent_extensions:
+        return ("Inconsistent formats", "Please make sure that all images have the same format.")
+    case AlignmentError.inconsistent_resolutions:
+        return ("Inconsistent resolution", "Please make sure that all images have the same resolution.")
+    case AlignmentError.missing_dng_converter:
+        return ("Missing Adobe DNG Converter", "Only DNG files are supported natively. If you wish to use other RAW formats, please download and install Adobe DNG Converter. Burst Photo will then be able to process most RAW formats automatically.")
+    case AlignmentError.conversion_failed:
+        return ("Conversion failed", "Image format not supported. Please only use unprocessed RAW or DNG images.")
+    case AlignmentError.non_bayer_exposure_bracketing:
+        return ("Unsupported exposure bracketing", "Exposure bracketing is not supported for your camera. Please only use images with uniform exposure.")
+    default:
+        return ("Unknown error", "Something went wrong. Sorry.")
+    }
+}
+
 struct MyAlert {
     var show: Bool = false
     var title: String?
@@ -15,6 +52,7 @@ struct MyAlert {
 
 struct ContentView: View {
     @ObservedObject var settings: AppSettings
+    @ObservedObject var inspection: InspectionCoordinator
     @State private var app_state = AppState.main
     @State private var image_urls: [URL] = []
     @StateObject var progress = ProcessingProgress()
@@ -23,7 +61,7 @@ struct ContentView: View {
     @State var drop_active = false
     
     var body: some View {
-        let drop_delegate = MyDropDelegate(settings: settings, app_state: $app_state, image_urls: $image_urls, progress: progress, active: $drop_active, my_alert: $my_alert, out_url: $out_url)
+        let drop_delegate = MyDropDelegate(settings: settings, app_state: $app_state, image_urls: $image_urls, progress: progress, active: $drop_active, my_alert: $my_alert, out_url: $out_url, inspection: inspection)
         
         Group {
             switch app_state {
@@ -84,7 +122,33 @@ struct ContentView: View {
                 settings.output_bit_depth = "Native"
             }
         })
+        .onAppear {
+            // bridge from the inspector window's merge button to the main window's state machine
+            inspection.merge_handler = { urls in self.run_merge(image_urls: urls) }
+        }
         .frame(width: 360, height: 400)
+    }
+    
+    /// Run the regular align+merge pipeline (triggered by the "Merge into image" button of the
+    /// alignment inspector window).
+    func run_merge(image_urls urls: [URL]) {
+        progress.int = 0
+        app_state = .processing
+        DispatchQueue.global().async {
+            do {
+                let out_url = try perform_denoising(image_urls: urls, progress: self.progress, merging_algorithm: self.settings.merging_algorithm, tile_size: self.settings.tile_size, search_distance: self.settings.search_distance, noise_reduction: self.settings.noise_reduction, exposure_control: exposure_control_short_names[self.settings.exposure_control] ?? "LinearFullRange", output_bit_depth: output_bit_depth_short_names[self.settings.output_bit_depth] ?? "Native", out_dir: NSHomeDirectory() + "/Pictures/Burst Photo/", tmp_dir: NSHomeDirectory() + "/Pictures/Burst Photo/.dngs/")
+                DispatchQueue.main.async {
+                    self.out_url = out_url
+                    self.app_state = .image_saved
+                }
+            } catch {
+                let message = processing_error_message(error)
+                DispatchQueue.main.async {
+                    self.my_alert = MyAlert(show: true, title: message.title, message: message.message, dismiss_button: .cancel())
+                    self.app_state = .main
+                }
+            }
+        }
     }
 }
 
@@ -93,7 +157,7 @@ struct DropIcon: View {
     @Binding var drop_active: Bool
     
     var body: some View {
-        Image(nsImage: NSImage(named: NSImage.Name("drop_icon"))!)
+        Image(nsImage: NSImage(named: NSImage.Name("drop_icon")) ?? NSImage())
             .resizable()
             .renderingMode(.template)
             .foregroundColor(.primary)
@@ -319,11 +383,18 @@ struct SettingsView: View {
                         }
                     }.pickerStyle(SegmentedPickerStyle()).frame(width: 216)
                 }.padding(.horizontal, 15).padding(.vertical, 11)
+                
+                Toggle("Inspect alignment before merging", isOn: settings.$inspect_alignment)
+                    .padding(.horizontal, 15).padding(.vertical, 8)
+                Text("Shows the alignment field and difference image of every frame in a separate window before merging.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 15)
                 Spacer()
                     .navigationTitle("Preferences")
             }.tabItem {Label("Stacking & Output  ", image: "stack_icon").imageScale(.large)}
         }
-        .frame(width: 390, height: 222)
+        .frame(width: 390, height: 284)
     }
 }
 
@@ -335,6 +406,7 @@ struct MyDropDelegate: DropDelegate {
     @Binding var active: Bool
     @Binding var my_alert: MyAlert
     @Binding var out_url: URL
+    @ObservedObject var inspection: InspectionCoordinator
     
     
     func validateDrop(info: DropInfo) -> Bool {
@@ -402,21 +474,10 @@ struct MyDropDelegate: DropDelegate {
         }
         
         // set simplified value for parameter exposure control
-        let exposure_control_dict = [
-            " Off"                       : "Off",
-            " Linear (full bit range)"   : "LinearFullRange",
-            " Linear (relative +1 EV)"   : "Linear1EV",
-            " Non-linear (target ±0 EV)" : "Curve0EV",
-            " Non-linear (target +1 EV)" : "Curve1EV",
-        ]
-        let exposure_control_short = exposure_control_dict[settings.exposure_control]!
+        let exposure_control_short = exposure_control_short_names[settings.exposure_control] ?? "LinearFullRange"
         
         // set simplified value for output bit depth
-        let output_bit_depth_dict = [
-            "Native"          : "Native",
-            "Scale to 16 bit" : "16Bit",
-        ]
-        let output_bit_depth_short = output_bit_depth_dict[settings.output_bit_depth]!
+        let output_bit_depth_short = output_bit_depth_short_names[settings.output_bit_depth] ?? "Native"
         
         DispatchQueue.global().async {
             // wait until all the urls are loaded
@@ -438,11 +499,21 @@ struct MyDropDelegate: DropDelegate {
             }
             
             do {               
-                // align and merge the burst
-                out_url = try perform_denoising(image_urls: image_urls, progress: progress, merging_algorithm: settings.merging_algorithm, tile_size: settings.tile_size, search_distance: settings.search_distance, noise_reduction: settings.noise_reduction, exposure_control: exposure_control_short, output_bit_depth: output_bit_depth_short, out_dir: NSHomeDirectory() + "/Pictures/Burst Photo/", tmp_dir: NSHomeDirectory() + "/Pictures/Burst Photo/.dngs/")
-                   
-                // inform the user about the saved image
-                app_state = .image_saved
+                if settings.inspect_alignment {
+                    // alignment inspection: visualize the alignment fields and difference images
+                    // of every frame against the reference frame before merging
+                    let session = try perform_alignment_inspection(image_urls: image_urls, progress: progress, tile_size: settings.tile_size, search_distance: settings.search_distance, tmp_dir: NSHomeDirectory() + "/Pictures/Burst Photo/.dngs/")
+                    DispatchQueue.main.async {
+                        app_state = .main
+                        inspection.show(session: session)
+                    }
+                } else {
+                    // align and merge the burst
+                    out_url = try perform_denoising(image_urls: image_urls, progress: progress, merging_algorithm: settings.merging_algorithm, tile_size: settings.tile_size, search_distance: settings.search_distance, noise_reduction: settings.noise_reduction, exposure_control: exposure_control_short, output_bit_depth: output_bit_depth_short, out_dir: NSHomeDirectory() + "/Pictures/Burst Photo/", tmp_dir: NSHomeDirectory() + "/Pictures/Burst Photo/.dngs/")
+                    
+                    // inform the user about the saved image
+                    app_state = .image_saved
+                }
 
             } catch ImageIOError.load_error {
                 my_alert.title = "Unsupported format"

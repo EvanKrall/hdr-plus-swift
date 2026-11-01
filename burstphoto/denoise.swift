@@ -37,7 +37,41 @@ class ProcessingProgress: ObservableObject {
 // set up Metal device
 let device = MTLCreateSystemDefaultDevice()!
 let command_queue = device.makeCommandQueue()!
-let mfl = device.makeDefaultLibrary()!
+
+// The shader library is normally precompiled into the app bundle as default.metallib by Xcode.
+// For builds without it (e.g. manual builds or future SwiftPM builds), fall back to compiling all
+// .metal files from the bundle resources at runtime. The runtime Metal compiler does not support
+// quoted #include directives, so the shared constants.h is inlined instead.
+let mfl: MTLLibrary = {
+    if let default_library = device.makeDefaultLibrary() {
+        return default_library
+    }
+    
+    guard let metal_urls = Bundle.main.urls(forResourcesWithExtension: "metal", subdirectory: nil), !metal_urls.isEmpty else {
+        fatalError("burstphoto: could not load the precompiled Metal library and found no .metal sources to compile at runtime.")
+    }
+    
+    var constants = ""
+    if let constants_url = Bundle.main.url(forResource: "constants", withExtension: "h") {
+        constants = (try? String(contentsOf: constants_url, encoding: .utf8)) ?? ""
+    }
+    
+    var source = constants + "\n"
+    for url in metal_urls.sorted(by: {$0.path < $1.path}) {
+        guard let file_source = try? String(contentsOf: url, encoding: .utf8) else { continue }
+        // drop quoted includes (runtime compiler limitation); keep #include <metal_stdlib>
+        let stripped = file_source.components(separatedBy: "\n")
+            .filter{!$0.contains("#include \"")}
+            .joined(separator: "\n")
+        source += stripped + "\n"
+    }
+    
+    do {
+        return try device.makeLibrary(source: source, options: nil)
+    } catch {
+        fatalError("burstphoto: could not compile the Metal shader library: \(error)")
+    }
+}()
 
 // Must use NSString and not String since NSCache needs classes.
 let textureCache = NSCache<NSString, ImageCacheWrapper>()
@@ -61,39 +95,46 @@ let search_distance_dict = [
 ]
 
 
-/// Main function of the burst photo app.
-func perform_denoising(image_urls: [URL], progress: ProcessingProgress, merging_algorithm: String = "Fast", tile_size: String = "Medium", search_distance: String = "Medium", noise_reduction: Double = 13.0, exposure_control: String = "LinearFullRange", output_bit_depth: String = "Native", out_dir: String, tmp_dir: String) throws -> URL {
+/// All data needed for alignment/merging after loading a burst and selecting the reference frame.
+struct BurstData {
+    var dng_urls: [URL]
+    var textures: [MTLTexture]
+    var mosaic_pattern_width: Int
+    var white_level: [Int]
+    var black_level: [[Int]]
+    var exposure_bias: [Int]
+    var ISO_exposure_time: [Double]
+    var color_factors: [[Double]]
+    var uniform_exposure: Bool
+    var ref_idx: Int
+    var convert_to_dng: Bool
+    var dng_converter_path: String
+    var dng_converter_present: Bool
+}
+
+/// Shared first stage of the processing pipeline: validate the burst, convert non-DNG RAW images,
+/// load all images and select the reference frame. Used by both the merging path
+/// (perform_denoising) and the alignment inspection (perform_alignment_inspection).
+func load_and_prepare_burst(image_urls: [URL], progress: ProcessingProgress?, tmp_dir: String) throws -> BurstData {
     
-    // Maximum size for the caches
+    // Maximum size for the in-memory cache
     let textureCacheMaxSizeMB: Double = min(10_000.0,
                                             0.15 * Double(ProcessInfo.processInfo.physicalMemory) / 1000.0 / 1000.0)
-    /// The initial value is set to be twice that of the in-memory cache.
-    /// It is capped between 4–10 GB, but never allowed to be greater that 15% of the total free disk space.
-    /// There is a hard cap of 15% of the total system free disk space.
-    let maxDNGFolderSizeGB: Double = min(10.0,
-                                         0.15 * systemFreeDiskSpace(),
-                                         max(4.0,
-                                             2 * textureCacheMaxSizeMB/1000))
-    
     textureCache.totalCostLimit = Int(textureCacheMaxSizeMB)
     
-    // measure execution time
-    let t0 = DispatchTime.now().uptimeNanoseconds
-    var t = t0
+    // check that 2+ images were provided
+    let n_images = image_urls.count
+    if n_images < 2 {throw AlignmentError.less_than_two_images}
     
     // check that all images are of the same extension
     let image_extension = image_urls[0].pathExtension
     let all_extensions_same = image_urls.allSatisfy{$0.pathExtension == image_extension}
     if !all_extensions_same {throw AlignmentError.inconsistent_extensions}
     
-    // check that 2+ images were provided
-    let n_images = image_urls.count
-    if n_images < 2 {throw AlignmentError.less_than_two_images}
-       
     // ensure that all files are .dng, converting them if necessary
     var dng_urls = image_urls
     let convert_to_dng = image_extension.lowercased() != "dng"
-    DispatchQueue.main.async { progress.includes_conversion = convert_to_dng }
+    if let progress = progress { DispatchQueue.main.async { progress.includes_conversion = convert_to_dng } }
     let dng_converter_path = "/Applications/Adobe DNG Converter.app"
     let dng_converter_present = FileManager.default.fileExists(atPath: dng_converter_path)
     
@@ -105,20 +146,19 @@ func perform_denoising(image_urls: [URL], progress: ProcessingProgress, merging_
         } else {
             // the dng converter is installed -> use it
             print("Converting images...")
+            let t_conversion = DispatchTime.now().uptimeNanoseconds
             dng_urls = try convert_raws_to_dngs(image_urls, dng_converter_path, tmp_dir, textureCache)
-            print("Time to convert images: ", Float(DispatchTime.now().uptimeNanoseconds - t) / 1_000_000_000)
-            DispatchQueue.main.async { progress.int += 10_000_000 }
-            t = DispatchTime.now().uptimeNanoseconds
+            print("Time to convert images: ", Float(DispatchTime.now().uptimeNanoseconds - t_conversion) / 1_000_000_000)
+            if let progress = progress { DispatchQueue.main.async { progress.int += 10_000_000 } }
         }
     }
-       
+    
     // load images
-    t = DispatchTime.now().uptimeNanoseconds
+    let t_loading = DispatchTime.now().uptimeNanoseconds
     print("Loading images...")
     var (textures, mosaic_pattern_width, white_level, black_level, exposure_bias, ISO_exposure_time, color_factors) = try load_images(dng_urls, textureCache: textureCache)
-    print("Time to load all images: ", Float(DispatchTime.now().uptimeNanoseconds - t) / 1_000_000_000)
-    t = DispatchTime.now().uptimeNanoseconds
-    DispatchQueue.main.async { progress.int += (convert_to_dng ? 10_000_000 : 20_000_000) }
+    print("Time to load all images: ", Float(DispatchTime.now().uptimeNanoseconds - t_loading) / 1_000_000_000)
+    if let progress = progress { DispatchQueue.main.async { progress.int += (convert_to_dng ? 10_000_000 : 20_000_000) } }
     
     var uniform_exposure = !exposure_bias.contains{$0 != exposure_bias[0]}
     
@@ -150,6 +190,60 @@ func perform_denoising(image_urls: [URL], progress: ProcessingProgress, merging_
     }
     // check for non-Bayer sensors that the exposure of images is uniform
     if (!uniform_exposure && mosaic_pattern_width != 2) {throw AlignmentError.non_bayer_exposure_bracketing}
+    
+    return BurstData(dng_urls: dng_urls,
+                     textures: textures,
+                     mosaic_pattern_width: mosaic_pattern_width,
+                     white_level: white_level,
+                     black_level: black_level,
+                     exposure_bias: exposure_bias,
+                     ISO_exposure_time: ISO_exposure_time,
+                     color_factors: color_factors,
+                     uniform_exposure: uniform_exposure,
+                     ref_idx: ref_idx,
+                     convert_to_dng: convert_to_dng,
+                     dng_converter_path: dng_converter_path,
+                     dng_converter_present: dng_converter_present)
+}
+
+
+/// Main function of the burst photo app.
+func perform_denoising(image_urls: [URL], progress: ProcessingProgress, merging_algorithm: String = "Fast", tile_size: String = "Medium", search_distance: String = "Medium", noise_reduction: Double = 13.0, exposure_control: String = "LinearFullRange", output_bit_depth: String = "Native", out_dir: String, tmp_dir: String) throws -> URL {
+    
+    // Maximum size for the caches
+    let textureCacheMaxSizeMB: Double = min(10_000.0,
+                                            0.15 * Double(ProcessInfo.processInfo.physicalMemory) / 1000.0 / 1000.0)
+    /// The initial value is set to be twice that of the in-memory cache.
+    /// It is capped between 4–10 GB, but never allowed to be greater that 15% of the total free disk space.
+    /// There is a hard cap of 15% of the total system free disk space.
+    let maxDNGFolderSizeGB: Double = min(10.0,
+                                         0.15 * systemFreeDiskSpace(),
+                                         max(4.0,
+                                             2 * textureCacheMaxSizeMB/1000))
+    
+    textureCache.totalCostLimit = Int(textureCacheMaxSizeMB)
+    
+    // measure execution time
+    let t0 = DispatchTime.now().uptimeNanoseconds
+    var t = t0
+    
+    // validate the burst, convert non-DNG RAW images, load all textures and select the reference
+    // frame (shared with the alignment inspection in inspect/inspect.swift)
+    let burst_data = try load_and_prepare_burst(image_urls: image_urls, progress: progress, tmp_dir: tmp_dir)
+    let dng_urls = burst_data.dng_urls
+    let textures = burst_data.textures
+    let mosaic_pattern_width = burst_data.mosaic_pattern_width
+    var white_level = burst_data.white_level
+    var black_level = burst_data.black_level
+    var color_factors = burst_data.color_factors
+    let exposure_bias = burst_data.exposure_bias
+    var ISO_exposure_time = burst_data.ISO_exposure_time
+    let uniform_exposure = burst_data.uniform_exposure
+    let ref_idx = burst_data.ref_idx
+    let convert_to_dng = burst_data.convert_to_dng
+    let dng_converter_path = burst_data.dng_converter_path
+    let dng_converter_present = burst_data.dng_converter_present
+    t = DispatchTime.now().uptimeNanoseconds
     
     // if user has selected a value different than "Off" for exposure control but has a non-Bayer sensor, warn them that exposure control = "Off" will be used instead
     var exposure_control = exposure_control

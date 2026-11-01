@@ -8,6 +8,7 @@ class AppSettings: ObservableObject {
     @AppStorage("noise_reduction") var noise_reduction: Double = 13.0
     @AppStorage("exposure_control") var exposure_control: String = " Linear (full bit range)"
     @AppStorage("output_bit_depth") var output_bit_depth: String = "Native"
+    @AppStorage("inspect_alignment") var inspect_alignment: Bool = true
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -65,10 +66,11 @@ extension Scene {
 struct burstphotoApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject var settings = AppSettings()
+    @StateObject var inspection = InspectionCoordinator()
     
     var body: some Scene {
         WindowGroup {
-            ContentView(settings: settings)
+            ContentView(settings: settings, inspection: inspection)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willUpdateNotification), perform: { _ in disable_window_resizing()})
                 .onAppear {initialize_xmp_sdk()}
                 .onDisappear {terminate_xmp_sdk()}
