@@ -8,6 +8,7 @@ import AppKit
 
 let render_alignment_color_state     = create_pipeline(with_function_name: "render_alignment_color", and_label: "Render Alignment Color")
 let abs_difference_state             = create_pipeline(with_function_name: "abs_difference",         and_label: "Abs Difference")
+let signed_difference_state          = create_pipeline(with_function_name: "signed_difference_rgba8", and_label: "Signed Difference")
 let gray_to_rgba8_state              = create_pipeline(with_function_name: "gray_to_rgba8",          and_label: "Gray to RGBA8")
 
 
@@ -165,6 +166,47 @@ func abs_difference(_ ref_texture: MTLTexture, _ comp_texture: MTLTexture, gain:
 }
 
 
+/// Tonemap the signed difference between two float textures to a color bitmap: comparison pixels
+/// brighter than the reference are red, darker pixels are blue, equality is black (see the
+/// signed_difference_rgba8 kernel). If `pool` > 1, both inputs are first averaged in blocks of
+/// `pool` x `pool` pixels to keep the readback cheap.
+func render_signed_difference_bitmap(_ ref_texture: MTLTexture, _ comp_texture: MTLTexture, gain: Float, offset: Float, white_point: Float, pool: Int = 4) -> NSBitmapImageRep {
+    
+    precondition(ref_texture.width == comp_texture.width && ref_texture.height == comp_texture.height)
+    let ref_source = (pool > 1) ? avg_pool(ref_texture, pool, 0.0, false, [-1.0, -1.0, -1.0]) : ref_texture
+    let comp_source = (pool > 1) ? avg_pool(comp_texture, pool, 0.0, false, [-1.0, -1.0, -1.0]) : comp_texture
+    
+    let output_descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                                     width: ref_source.width,
+                                                                     height: ref_source.height,
+                                                                     mipmapped: false)
+    output_descriptor.usage = [.shaderRead, .shaderWrite]
+    output_descriptor.storageMode = .shared
+    let output_texture = device.makeTexture(descriptor: output_descriptor)!
+    output_texture.label = "Signed Difference"
+    
+    let command_buffer = command_queue.makeCommandBuffer()!
+    command_buffer.label = "Signed Difference"
+    let command_encoder = command_buffer.makeComputeCommandEncoder()!
+    command_encoder.label = command_buffer.label
+    command_encoder.setComputePipelineState(signed_difference_state)
+    let threads_per_grid = MTLSize(width: output_texture.width, height: output_texture.height, depth: 1)
+    let threads_per_thread_group = get_threads_per_thread_group(signed_difference_state, threads_per_grid)
+    command_encoder.setTexture(ref_source, index: 0)
+    command_encoder.setTexture(comp_source, index: 1)
+    command_encoder.setTexture(output_texture, index: 2)
+    command_encoder.setBytes([Float32(gain)], length: MemoryLayout<Float32>.stride, index: 0)
+    command_encoder.setBytes([Float32(offset)], length: MemoryLayout<Float32>.stride, index: 1)
+    command_encoder.setBytes([Float32(white_point)], length: MemoryLayout<Float32>.stride, index: 2)
+    command_encoder.dispatchThreads(threads_per_grid, threadsPerThreadgroup: threads_per_thread_group)
+    command_encoder.endEncoding()
+    command_buffer.commit()
+    command_buffer.waitUntilCompleted()
+    
+    return bitmap_from_rgba8_texture(output_texture)
+}
+
+
 /// Read a float texture back to the CPU as mean-pooled values (pool size divides both dimensions).
 func pooled_values(_ texture: MTLTexture, preferred_pool: Int) -> (values: [Float], pool: Int) {
     
@@ -239,6 +281,72 @@ func brightness_match_values(_ ref_values: [Float], _ comp_values: [Float]) -> (
         return (gain: 1.0, offset: 0.0)
     }
     return (gain: gain, offset: offset)
+}
+
+
+/// Robust brightness match that maximizes the number of pixels with approximately zero difference
+/// (inliers, within `tolerance`) instead of minimizing least squares, so that moving content and
+/// occlusions do not bias the fit. For every candidate gain, the optimal offset is found exactly
+/// with an interval-covering sweep; the gain with the most inliers wins and is then refined.
+/// Returns (gain, offset, inlier fraction). Falls back to a least-squares fit if fewer than 25%
+/// of the values can be described by a single (gain, offset) pair.
+func robust_brightness_match_values(_ ref_values: [Float], _ comp_values: [Float], tolerance: Float) -> (gain: Float, offset: Float, inlier_fraction: Float) {
+    
+    precondition(ref_values.count == comp_values.count)
+    let n = ref_values.count
+    guard n >= 16 else { return (1.0, 0.0, 0.0) }
+    let tol = max(tolerance, 1e-4)
+    
+    // For a fixed gain g, inliers are the residuals r_i = y_i - g*x_i with |r_i - o| <= tol, i.e.
+    // the offset o must lie in the interval [r_i - tol, r_i + tol]. The region covered by the most
+    // intervals is found exactly by a sweep over the 2n interval endpoints; the midpoint of that
+    // region is used as the offset.
+    func best_offset_for_gain(_ gain: Float) -> (offset: Float, inliers: Int) {
+        var events = [(position: Float, delta: Int)]()
+        events.reserveCapacity(2 * n)
+        for i in 0..<n {
+            let residual = ref_values[i] - gain * comp_values[i]
+            events.append((residual - tol, 1))
+            events.append((residual + tol + 1e-6, -1))
+        }
+        events.sort { $0.position < $1.position }
+        var count = 0
+        var best_inliers = 0
+        var best_left: Float = 0
+        var best_right: Float = 0
+        for event in events {
+            // if the current maximum region ends here, close it at this position
+            if count == best_inliers && best_inliers > 0 {
+                best_right = event.position
+            }
+            count += event.delta
+            if count > best_inliers {
+                best_inliers = count
+                best_left = event.position
+            }
+        }
+        return (0.5 * (best_left + best_right), best_inliers)
+    }
+    
+    var best = (inliers: -1, gain: Float(1.0), offset: Float(0.0))
+    var gain: Float = 0.6
+    while gain <= 1.7 {
+        let (offset, inliers) = best_offset_for_gain(gain)
+        if inliers > best.inliers { best = (inliers, gain, offset) }
+        gain += 0.01
+    }
+    var fine_gain = best.gain - 0.01
+    while fine_gain <= best.gain + 0.01 {
+        let (offset, inliers) = best_offset_for_gain(fine_gain)
+        if inliers > best.inliers { best = (inliers, fine_gain, offset) }
+        fine_gain += 0.002
+    }
+    
+    if best.inliers * 4 < n {
+        let least_squares = brightness_match_values(ref_values, comp_values)
+        return (least_squares.gain, least_squares.offset, Float(best.inliers) / Float(n))
+    }
+    return (best.gain, best.offset, Float(best.inliers) / Float(n))
 }
 
 

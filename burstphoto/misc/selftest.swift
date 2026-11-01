@@ -286,6 +286,53 @@ func run_selftest() -> Bool {
     test.check("matched residual much smaller than raw", matched_diff.mean < 0.01 && raw_diff.mean > 5.0 * max(matched_diff.mean, 0.001),
                "matched \(matched_diff.mean) vs raw \(raw_diff.mean)")
     
+    // robust brightness match: ~70% of the values follow y = 0.8*x - 0.016 (small noise), the rest
+    // are outliers spread over [0, 1]. The fit must follow the inliers, not the outliers.
+    var robust_x: [Float] = []
+    var robust_y: [Float] = []
+    robust_x.reserveCapacity(2000)
+    robust_y.reserveCapacity(2000)
+    var rng_state: UInt64 = 12345
+    func pseudo_random() -> Double {
+        rng_state = rng_state &* 6364136223846793005 &+ 1442695040888963407
+        return Double(rng_state >> 11) / Double(1 << 53)
+    }
+    for i in 0..<2000 {
+        let x = Float(0.1 + 0.8 * Double(i) / 1999.0)
+        robust_x.append(x)
+        if pseudo_random() < 0.7 {
+            robust_y.append(0.8 * x - 0.016 + Float((pseudo_random() - 0.5) * 0.004))
+        } else {
+            robust_y.append(Float(pseudo_random()))
+        }
+    }
+    let robust_fit = robust_brightness_match_values(robust_y, robust_x, tolerance: 0.01)
+    test.check("robust brightness match ignores outliers", abs(robust_fit.gain - 0.8) < 0.03 && abs(robust_fit.offset + 0.016) < 0.01,
+               "gain \(robust_fit.gain), offset \(robust_fit.offset), inlier fraction \(robust_fit.inlier_fraction)")
+    test.check("robust brightness match inlier fraction", robust_fit.inlier_fraction > 0.6, "inlier fraction = \(robust_fit.inlier_fraction)")
+    
+    // signed difference coloring: comparison brighter than reference -> red, darker -> blue
+    let signed_ref = make_float_texture([Float](repeating: 0.5, count: width * height), width, height, label: "Selftest signed ref")
+    var signed_comp_data = [Float](repeating: 0.0, count: width * height)
+    for y in 0..<height {
+        let value: Float = y < height / 3 ? 0.6 : (y < 2 * height / 3 ? 0.4 : 0.5)
+        for x in 0..<width {
+            signed_comp_data[y * width + x] = value
+        }
+    }
+    let signed_comp = make_float_texture(signed_comp_data, width, height, label: "Selftest signed comp")
+    let signed_bitmap = render_signed_difference_bitmap(signed_ref, signed_comp, gain: 1.0, offset: 0.0, white_point: 0.1, pool: 1)
+    func signed_pixel(_ x: Int, _ y: Int) -> (r: Int, g: Int, b: Int) {
+        let offset = (y * signed_bitmap.pixelsWide + x) * 4
+        return (Int(signed_bitmap.bitmapData![offset]), Int(signed_bitmap.bitmapData![offset + 1]), Int(signed_bitmap.bitmapData![offset + 2]))
+    }
+    let brighter = signed_pixel(width / 2, height / 6)
+    let darker = signed_pixel(width / 2, height / 2)
+    let equal = signed_pixel(width / 2, 5 * height / 6)
+    test.check("signed difference: brighter is red", brighter.r >= 250 && brighter.b <= 5, "got R \(brighter.r) B \(brighter.b)")
+    test.check("signed difference: darker is blue", darker.b >= 250 && darker.r <= 5, "got R \(darker.r) B \(darker.b)")
+    test.check("signed difference: equal is black", equal.r <= 5 && equal.b <= 5, "got R \(equal.r) B \(equal.b)")
+    
     // ------------------------------------------------------------------
     print("")
     if test.failures == 0 {

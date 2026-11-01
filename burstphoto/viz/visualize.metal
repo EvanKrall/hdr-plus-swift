@@ -98,6 +98,28 @@ kernel void abs_difference(texture2d<float, access::read> ref_texture [[texture(
 
 
 /**
+ Tonemap the SIGNED difference between two float textures to a color bitmap: pixels where the
+ (brightness-matched) comparison texture is BRIGHTER than the reference are mapped to red, pixels
+ where it is DARKER to blue, and equality to black. The difference is divided by 'white_point'
+ before clamping.
+ */
+kernel void signed_difference_rgba8(texture2d<float, access::read> ref_texture [[texture(0)]],
+                                    texture2d<float, access::read> comp_texture [[texture(1)]],
+                                    texture2d<float, access::write> out_texture [[texture(2)]],
+                                    constant float& gain [[buffer(0)]],
+                                    constant float& offset [[buffer(1)]],
+                                    constant float& white_point [[buffer(2)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+    
+    float const difference = (gain * comp_texture.read(gid).r + offset) - ref_texture.read(gid).r;
+    float const white = max(white_point, 1e-9f);
+    float const red = clamp(difference / white, 0.0f, 1.0f);
+    float const blue = clamp(-difference / white, 0.0f, 1.0f);
+    out_texture.write(float4(red, 0.0f, blue, 1.0f), gid);
+}
+
+
+/**
  Tonemap a single-channel float texture to an 8-bit RGBA texture that can be read back on the CPU
  and displayed. The input value is divided by 'white_point' and multiplied by 'gain', then clamped.
  */

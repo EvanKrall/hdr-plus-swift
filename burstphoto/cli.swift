@@ -15,6 +15,8 @@ import MetalPerformanceShaders
 //                                              pyramid-level-0 pixels (default: auto = max |shift|)
 //   burstphoto-cli selftest                    run built-in verification tests of the alignment
 //                                              inspection pipeline (no input files needed)
+//   burstphoto-cli afinfo <file>                print the autofocus area parsed from a NEF's maker
+//                                              notes (used as the default subject area in the GUI)
 
 @main
 struct MyProgram {
@@ -38,6 +40,21 @@ struct MyProgram {
                 exit(1)
             }
             try run_inspection_cli(burst_dir: arguments[2], options: Array(arguments[3...]))
+            terminate_xmp_sdk()
+            return
+        }
+        
+        if arguments.count >= 2 && arguments[1] == "afinfo" {
+            guard arguments.count >= 3 else {
+                print("usage: burstphoto-cli afinfo <file>")
+                terminate_xmp_sdk()
+                exit(1)
+            }
+            if let af = read_af_area(url: URL(fileURLWithPath: arguments[2])) {
+                print("AF area: center (\(af.x), \(af.y)) size \(af.width)×\(af.height) of \(af.image_width)×\(af.image_height)")
+            } else {
+                print("no AF area found")
+            }
             terminate_xmp_sdk()
             return
         }
@@ -122,6 +139,7 @@ struct MyProgram {
         var match_exposure = true
         var diff_gain: Float = 4.0
         var diff_scale: Float? = nil
+        var dump_alignment = false
         var i = 0
         while i < options.count {
             switch options[i] {
@@ -139,6 +157,8 @@ struct MyProgram {
                 i += 1; diff_gain = Float(options[i]) ?? 4.0
             case "--diff-scale":
                 i += 1; diff_scale = Float(options[i])
+            case "--dump-alignment":
+                dump_alignment = true
             default:
                 print("unknown option:", options[i])
                 exit(1)
@@ -176,6 +196,27 @@ struct MyProgram {
         let t0 = DispatchTime.now().uptimeNanoseconds
         let session = try perform_alignment_inspection(image_urls: image_urls, progress: progress, tile_size: tile_size, search_distance: search_distance, tmp_dir: tmp_dir)
         print("Time to align all images: ", Float(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000_000, "s")
+        
+        if dump_alignment {
+            // raw per-tile alignment shifts per frame: int32 n_tiles_x, int32 n_tiles_y, then
+            // n_tiles_x * n_tiles_y * 2 little-endian int16 (dx, dy per tile, level-0 pixels)
+            let dump_dir = out_dir + "/alignment_dump"
+            try fm.createDirectory(atPath: dump_dir, withIntermediateDirectories: true)
+            for frame in session.frames {
+                guard let alignment = frame.alignment_texture else { continue }
+                let texels = read_alignment_texels(alignment)
+                var data = Data()
+                func append32(_ value: Int32) {
+                    var le = value.littleEndian
+                    withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+                }
+                append32(Int32(alignment.width))
+                append32(Int32(alignment.height))
+                texels.withUnsafeBytes { data.append(contentsOf: $0) }
+                try data.write(to: URL(fileURLWithPath: dump_dir + "/frame_\(String(format: "%02d", frame.index))_\(frame.url.lastPathComponent).bin"))
+            }
+            print("alignment texels dumped to \(dump_dir)")
+        }
         
         // export visualizations
         var report = "burst: \(burst_dir)\nreference: \(session.frames[session.ref_idx].url.lastPathComponent)\n"
