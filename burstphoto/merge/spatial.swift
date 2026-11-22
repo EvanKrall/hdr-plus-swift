@@ -65,12 +65,15 @@ func align_merge_spatial_domain(progress: ProcessingProgress, ref_idx: Int, mosa
     let noise_sd = estimate_color_noise(ref_texture_cropped, ref_texture_blurred, mosaic_pattern_width)
 
     // iterate over comparison images
+    // (hoisted out of the progress closures below: a closure capturing `textures` would retain
+    // every input texture on the never-draining main queue of a CLI process — the CLI memory leak)
+    let progress_units_per_frame = Int(80000000/Double(textures.count))
     for comp_idx in 0..<textures.count {
         
         // add the reference texture to the output
         if comp_idx == ref_idx {
             add_texture(ref_texture_cropped, final_texture, textures.count)
-            DispatchQueue.main.async { progress.int += Int(80000000/Double(textures.count)) }
+            DispatchQueue.main.async { progress.int += progress_units_per_frame }
             continue
         }
             
@@ -93,7 +96,7 @@ func align_merge_spatial_domain(progress: ProcessingProgress, ref_idx: Int, mosa
         add_texture(merged_texture, final_texture, textures.count)
         
         // sync GUI progress
-        DispatchQueue.main.async { progress.int += Int(80000000/Double(textures.count)) }
+        DispatchQueue.main.async { progress.int += progress_units_per_frame }
     }
 }
 

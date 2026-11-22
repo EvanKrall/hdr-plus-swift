@@ -294,6 +294,10 @@
 		FAC0DE0A00000000000000C6 /* inspect.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC0DE0A00000000000000B3 /* inspect.swift */; };
 		FAC0DE0A00000000000000C7 /* selftest.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC0DE0A00000000000000B4 /* selftest.swift */; };
 		FAC0DE0A00000000000000C8 /* AlignmentInspectorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC0DE0A00000000000000B5 /* AlignmentInspectorView.swift */; };
+		FAC0DE0A00000000000000D3 /* autoburst.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC0DE0A00000000000000D2 /* autoburst.swift */; };
+		FAC0DE0A00000000000000D4 /* autoburst.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC0DE0A00000000000000D2 /* autoburst.swift */; };
+		FAC0DE0A00000000000000D6 /* stack_record.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC0DE0A00000000000000D5 /* stack_record.swift */; };
+		FAC0DE0A00000000000000D7 /* stack_record.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAC0DE0A00000000000000D5 /* stack_record.swift */; };
 		FAED70EF2A539F9A00BF63BD /* constants.h in Sources */ = {isa = PBXBuildFile; fileRef = FAED70EE2A539F9A00BF63BD /* constants.h */; };
 		FAED70F02A539F9A00BF63BD /* constants.h in Sources */ = {isa = PBXBuildFile; fileRef = FAED70EE2A539F9A00BF63BD /* constants.h */; };
 		FAED70F22A53A12700BF63BD /* exposure.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAED70F12A53A12700BF63BD /* exposure.swift */; };
@@ -692,6 +696,8 @@
 		FAC0DE0A00000000000000B1 /* visualize.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = visualize.metal; sourceTree = "<group>"; };
 		FAC0DE0A00000000000000B2 /* visualize.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = visualize.swift; sourceTree = "<group>"; };
 		FAC0DE0A00000000000000B3 /* inspect.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = inspect.swift; sourceTree = "<group>"; };
+		FAC0DE0A00000000000000D2 /* autoburst.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = autoburst.swift; sourceTree = "<group>"; };
+		FAC0DE0A00000000000000D5 /* stack_record.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = stack_record.swift; sourceTree = "<group>"; };
 		FAC0DE0A00000000000000B4 /* selftest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = selftest.swift; sourceTree = "<group>"; };
 		FAC0DE0A00000000000000B5 /* AlignmentInspectorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlignmentInspectorView.swift; sourceTree = "<group>"; };
 		FAED70EE2A539F9A00BF63BD /* constants.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = constants.h; sourceTree = "<group>"; };
@@ -1313,6 +1319,7 @@
 			children = (
 				E1ACED6926A490A1009B14EB /* App.swift */,
 				FAED70E62A539CD000BF63BD /* align */,
+				FAC0DE0A00000000000000D1 /* burst */,
 				FAC0DE0A00000000000000A2 /* inspect */,
 				FAC0DE0A00000000000000A1 /* viz */,
 				FAED70FA2A53A2F100BF63BD /* exposure */,
@@ -1377,6 +1384,15 @@
 				FAED70EB2A539ED200BF63BD /* align.metal */,
 			);
 			path = align;
+			sourceTree = "<group>";
+		};
+		FAC0DE0A00000000000000D1 /* burst */ = {
+			isa = PBXGroup;
+			children = (
+				FAC0DE0A00000000000000D2 /* autoburst.swift */,
+				FAC0DE0A00000000000000D5 /* stack_record.swift */,
+			);
+			path = burst;
 			sourceTree = "<group>";
 		};
 		FAED70E72A539CE000BF63BD /* merge */ = {
@@ -1576,6 +1592,8 @@
 				FAC0DE0A00000000000000C3 /* visualize.swift in Sources */,
 				FAC0DE0A00000000000000C5 /* inspect.swift in Sources */,
 				FAC0DE0A00000000000000C8 /* AlignmentInspectorView.swift in Sources */,
+				FAC0DE0A00000000000000D3 /* autoburst.swift in Sources */,
+				FAC0DE0A00000000000000D6 /* stack_record.swift in Sources */,
 				E133ADBE28FEF8770058B799 /* dng_string.cpp in Sources */,
 				E133ADA928FEF8770058B799 /* dng_safe_arithmetic.cpp in Sources */,
 				E133ADAC28FEF8770058B799 /* dng_linearization_info.cpp in Sources */,
@@ -1770,6 +1788,8 @@
 				FAC0DE0A00000000000000C4 /* visualize.swift in Sources */,
 				FAC0DE0A00000000000000C6 /* inspect.swift in Sources */,
 				FAC0DE0A00000000000000C7 /* selftest.swift in Sources */,
+				FAC0DE0A00000000000000D4 /* autoburst.swift in Sources */,
+				FAC0DE0A00000000000000D7 /* stack_record.swift in Sources */,
 				E1F0A2532909D80D00AB127E /* jctrans.c in Sources */,
 				E1F0A2542909D80D00AB127E /* dng_pthread.cpp in Sources */,
 				E1F0A2552909D80D00AB127E /* dng_tag_types.cpp in Sources */,

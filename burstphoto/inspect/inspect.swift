@@ -127,6 +127,107 @@ func read_af_area(url: URL) -> (x: Int, y: Int, width: Int, height: Int, image_w
     return nil
 }
 
+/// A rectangular "subject" area, as fractions of the frame (origin top-left, x1/y1 included).
+/// Dragged by the user in the inspector; derived from the AF point for automatic scoring.
+struct RoiRect: Equatable {
+    var x0: CGFloat
+    var y0: CGFloat
+    var x1: CGFloat
+    var y1: CGFloat
+
+    func normalized() -> RoiRect {
+        RoiRect(x0: min(x0, x1), y0: min(y0, y1), x1: max(x0, x1), y1: max(y0, y1))
+    }
+
+    var is_degenerate: Bool { abs(x1 - x0) * abs(y1 - y0) < 0.0005 }
+}
+
+
+/// Region of interest around the reference frame's autofocus area (the selected AF point doubled
+/// in size, minimum 4% of the frame), as fractions of the frame. Nil if the camera recorded no
+/// AF position (see read_af_area).
+func af_subject_roi(session: InspectionSession) -> RoiRect? {
+    guard let af = session.af_area, af.image_width > 0, af.image_height > 0 else { return nil }
+    let image_w = CGFloat(af.image_width), image_h = CGFloat(af.image_height)
+    let cx = CGFloat(af.x) / image_w
+    let cy = CGFloat(af.y) / image_h
+    let extent_w = max(CGFloat(af.width) / image_w * 2.0, 0.04)  // 2x the AF area, min 4% of frame
+    let extent_h = max(CGFloat(af.height) / image_h * 2.0, 0.04)
+    return RoiRect(x0: max(0, cx - extent_w / 2), y0: max(0, cy - extent_h / 2),
+                   x1: min(1, cx + extent_w / 2), y1: min(1, cy + extent_h / 2))
+}
+
+
+/// Default subject area for automatic frame scoring: the region around the reference frame's
+/// selected autofocus point (see af_subject_roi), or a centered rectangle covering half the
+/// frame when the camera recorded no AF position.
+func auto_burst_subject_roi(session: InspectionSession) -> RoiRect {
+    if let roi = af_subject_roi(session: session) { return roi }
+    return RoiRect(x0: 0.25, y0: 0.25, x1: 0.75, y1: 0.75)
+}
+
+
+/// Median of an already sorted array.
+func median_of_sorted(_ values: [Double]) -> Double {
+    if values.isEmpty { return 1.0 }
+    let mid = values.count / 2
+    return values.count % 2 == 1 ? values[mid] : 0.5 * (values[mid - 1] + values[mid])
+}
+
+
+/// Variation of the tile alignment field inside a rectangle (fractions of the frame, y from
+/// top): each tile's shift is compared to the per-axis median shift of the region, combined to a
+/// magnitude, and averaged over all tiles in the region (no outlier exclusion — the
+/// worst-matching tiles are the signal). Only tiles fully inside the rectangle are used when
+/// there are at least four of them (boundary tiles mix subject and background motion);
+/// otherwise overlapping tiles are used. Returns the score in level-0 pixels (lower = more rigid
+/// mapping to the reference); nil if the rectangle is smaller than a few tiles.
+func alignment_variation_in_roi(texels: [Int16], alignment_width: Int, alignment_height: Int, tile_size: Int, downscale_factor: Int, roi: RoiRect, frame_width: Int, frame_height: Int, pad_x: Int, pad_y: Int) -> Float? {
+    
+    guard texels.count >= alignment_width * alignment_height * 2 else { return nil }
+    let n_tiles_x = alignment_width, n_tiles_y = alignment_height
+    // tile geometry: the alignment grid spans the PADDED frame at 1/downscale scale; tile ix
+    // centers at level-0 x = (ix + 1) * tile_size / 2 (see warp_texture_bayer). Frame pixels
+    // therefore map to level-0 pixels as (x + pad) / downscale.
+    let downscale = CGFloat(downscale_factor)
+    let half_tile = CGFloat(tile_size) / 2
+    let n = roi.normalized()
+    let x0 = (n.x0 * CGFloat(frame_width) + CGFloat(pad_x)) / downscale
+    let x1 = (n.x1 * CGFloat(frame_width) + CGFloat(pad_x)) / downscale
+    let y0 = (n.y0 * CGFloat(frame_height) + CGFloat(pad_y)) / downscale
+    let y1 = (n.y1 * CGFloat(frame_height) + CGFloat(pad_y)) / downscale
+    
+    var inner: [(Float, Float)] = []
+    var overlap: [(Float, Float)] = []
+    for ty in 0..<n_tiles_y {
+        let cy = (CGFloat(ty) + 1) * half_tile
+        for tx in 0..<n_tiles_x {
+            let cx = (CGFloat(tx) + 1) * half_tile
+            let i = (ty * n_tiles_x + tx) * 2
+            let shift = (Float(texels[i]), Float(texels[i + 1]))
+            if cx >= x0 + half_tile, cx <= x1 - half_tile, cy >= y0 + half_tile, cy <= y1 - half_tile {
+                inner.append(shift)
+            } else if cx >= x0 - half_tile, cx <= x1 + half_tile, cy >= y0 - half_tile, cy <= y1 + half_tile {
+                overlap.append(shift)
+            }
+        }
+    }
+    let tiles = inner.count >= 4 ? inner : overlap
+    guard tiles.count >= 4 else { return nil }
+    
+    // robust center: per-axis median shift, then mean per-tile deviation magnitude (the
+    // median only makes the measure translation-invariant — no tiles are excluded)
+    let med_x = Float(median_of_sorted(tiles.map { Double($0.0) }.sorted()))
+    let med_y = Float(median_of_sorted(tiles.map { Double($0.1) }.sorted()))
+    var sum = 0.0
+    for shift in tiles {
+        let dx = shift.0 - med_x, dy = shift.1 - med_y
+        sum += Double(sqrt(dx * dx + dy * dy))
+    }
+    return Float(sum / Double(tiles.count))
+}
+
+
 class InspectionSession: ObservableObject {
     /// one entry per frame of the burst, in the order the images were passed in
     let frames: [InspectionFrame]
@@ -271,6 +372,9 @@ func perform_alignment_inspection(image_urls: [URL], progress: ProcessingProgres
     let ref_pyramid = build_pyramid(ref_texture, downscale_factor_array, black_level_mean, burst.color_factors[ref_idx])
     
     // align every comparison frame
+    // (hoisted out of the progress closures below: a closure capturing `textures` would retain
+    // every input texture on the never-draining main queue of a CLI process — the CLI memory leak)
+    let progress_units_per_frame = Int(80000000/Double(textures.count))
     var frames: [InspectionFrame] = []
     for comp_idx in 0..<textures.count {
         
@@ -278,7 +382,7 @@ func perform_alignment_inspection(image_urls: [URL], progress: ProcessingProgres
             frames.append(InspectionFrame(index: comp_idx, url: image_urls[comp_idx], is_reference: true,
                                           alignment_texture: nil, tile_info: nil,
                                           downscale_factor: downscale_factor_array[0], stats: nil))
-            if let progress = progress { DispatchQueue.main.async { progress.int += Int(80000000/Double(textures.count)) } }
+            if let progress = progress { DispatchQueue.main.async { progress.int += progress_units_per_frame } }
             continue
         }
         
@@ -293,7 +397,7 @@ func perform_alignment_inspection(image_urls: [URL], progress: ProcessingProgres
         frames.append(InspectionFrame(index: comp_idx, url: image_urls[comp_idx], is_reference: false,
                                       alignment_texture: output.alignment_texture, tile_info: output.tile_info,
                                       downscale_factor: output.downscale_factor, stats: stats))
-        if let progress = progress { DispatchQueue.main.async { progress.int += Int(80000000/Double(textures.count)) } }
+        if let progress = progress { DispatchQueue.main.async { progress.int += progress_units_per_frame } }
     }
     
     let session = InspectionSession(frames: frames,

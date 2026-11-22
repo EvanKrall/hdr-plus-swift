@@ -29,6 +29,8 @@ You can download the app from the [Mac App Store](https://burst.photo/download/)
 # Features
 - [x] DNG support
 - [x] RAW support (requires Adobe DNG Converter to be installed)
+- [x] automatic burst detection: drop a folder of RAW images and the bursts are found by EXIF capture time, with frames that match the reference poorly rejected automatically
+- [x] every merged image is accompanied by a .json stack file (input files, selected frames, settings) — drop it back onto the app to re-open the frame selection and re-merge
 - [x] simple temporal averaging
 - [x] motion-robust merge in spatial domain (simplified)
 - [x] motion-robust merge in frequency domain (similar to original publication)

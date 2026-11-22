@@ -190,8 +190,9 @@ func align_merge_frequency_domain(progress: ProcessingProgress, ref_idx: Int, mo
             // merge aligned comparison texture with reference texture in the frequency domain
             merge_frequency_domain(ref_texture_ft, aligned_texture_ft, final_texture_ft, rms_texture, mismatch_texture, highlights_norm_texture, robustness_norm, read_noise, max_motion_norm_exposure, uniform_exposure, tile_info_merge)
             
-            // sync GUI progress
-            DispatchQueue.main.async { progress.int += Int(80000000/Double(4*(textures.count-1))) }
+            // sync GUI progress (count hoisted so the closure captures only an Int, not `textures`)
+            let progress_units_per_frame = Int(80000000/Double(4*(textures.count-1)))
+            DispatchQueue.main.async { progress.int += progress_units_per_frame }
         }
         // apply simple deconvolution to slightly correct potential blurring from misalignment of bursts
         deconvolute_frequency_domain(final_texture_ft, total_mismatch_texture, tile_info_merge)

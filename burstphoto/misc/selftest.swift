@@ -334,6 +334,96 @@ func run_selftest() -> Bool {
     test.check("signed difference: equal is black", equal.r <= 5 && equal.b <= 5, "got R \(equal.r) B \(equal.b)")
     
     // ------------------------------------------------------------------
+    // 6. automatic burst detection: EXIF timestamp parsing and grouping
+    // ------------------------------------------------------------------
+    let base = parse_exif_datetime("2024:07:14 10:20:30", subsecond: nil)
+    test.check("exif datetime parses", base != nil)
+    if let base = base {
+        let subsec = parse_exif_datetime("2024:07:14 10:20:30", subsecond: "91")
+        test.check("exif subsecond is fractional", subsec != nil && abs(subsec!.timeIntervalSince(base) - 0.91) < 1e-6,
+                   "delta = \(subsec.map { $0.timeIntervalSince(base) } ?? -1)")
+        let subsec3 = parse_exif_datetime("2024:07:14 10:20:30", subsecond: "051")
+        test.check("exif 3-digit subsecond is fractional", subsec3 != nil && abs(subsec3!.timeIntervalSince(base) - 0.051) < 1e-6,
+                   "delta = \(subsec3.map { $0.timeIntervalSince(base) } ?? -1)")
+        test.check("exif datetime rejects garbage", parse_exif_datetime("not a date", subsecond: nil) == nil)
+        
+        // grouping: capture times in seconds relative to the base time
+        func offset(_ seconds: Double) -> Date { base.addingTimeInterval(seconds) }
+        func url_for(_ name: String) -> URL { URL(fileURLWithPath: "/tmp/autoburst_selftest/\(name).nef") }
+        
+        // burst 1: 0.0, 0.4, 0.9 s; burst 2: 2.0, 3.0 s (exactly 1 s apart -> same burst);
+        // burst 3: 4.5 s alone; burst 4: 6.0 s; then 7.5 s (1.5 s gap -> new burst)
+        let times: [(String, Double)] = [("a3", 0.9), ("a1", 0.0), ("a2", 0.4),
+                                         ("b1", 2.0), ("b2", 3.0),
+                                         ("c1", 4.5),
+                                         ("d1", 6.0), ("e1", 7.5)]
+        var timestamps: [URL: Date] = [:]
+        for (name, seconds) in times { timestamps[url_for(name)] = offset(seconds) }
+        // one file with no timestamp must be ignored entirely
+        let bursts = split_into_bursts(urls: times.map { url_for($0.0) } + [url_for("no_time")],
+                                       timestamps: timestamps, max_gap: 1.0)
+        test.check("burst grouping count", bursts.count == 5, "got \(bursts.count) groups")
+        test.check("burst grouping sizes", bursts.map { $0.count } == [3, 2, 1, 1, 1],
+                   "sizes = \(bursts.map { $0.count })")
+        test.check("burst grouping sorts by time", bursts.first?.map { $0.lastPathComponent } == ["a1.nef", "a2.nef", "a3.nef"],
+                   "first group = \(bursts.first?.map { $0.lastPathComponent } ?? [])")
+        test.check("1 s gap stays in one burst", bursts.count > 1 && bursts[1].count == 2,
+                   "second group = \(bursts.count > 1 ? bursts[1].count : -1)")
+    }
+    
+    // ------------------------------------------------------------------
+    // 7. stack record sidecar round trip
+    // ------------------------------------------------------------------
+    do {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("burstphoto_selftest_stack", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        
+        let record = StackRecord(app_version: "selftest",
+                                 created_at: Date(),
+                                 output_file: dir.appendingPathComponent("merged_f13_l0.dng").path,
+                                 initial_files: ["/tmp/a.nef", "/tmp/b.nef", "/tmp/c.nef"],
+                                 selected_files: ["/tmp/a.nef", "/tmp/c.nef"],
+                                 merging_algorithm: "Fast",
+                                 tile_size: "Medium",
+                                 search_distance: "Large",
+                                 noise_reduction: 13.0,
+                                 exposure_control: "LinearFullRange",
+                                 output_bit_depth: "Native")
+        try save_stack_record(record)
+        test.check("stack sidecar is written next to the output", FileManager.default.fileExists(atPath: dir.appendingPathComponent("merged_f13_l0.json").path))
+        
+        if let loaded = load_stack_record(url: record.sidecar_url) {
+            test.check("stack sidecar round trip preserves the fields",
+                       loaded.initial_files == record.initial_files
+                       && loaded.selected_files == record.selected_files
+                       && loaded.merging_algorithm == record.merging_algorithm
+                       && loaded.tile_size == record.tile_size
+                       && loaded.search_distance == record.search_distance
+                       && loaded.noise_reduction == record.noise_reduction
+                       && loaded.exposure_control == record.exposure_control
+                       && loaded.output_bit_depth == record.output_bit_depth
+                       && loaded.output_file == record.output_file
+                       && abs(loaded.created_at.timeIntervalSince(record.created_at)) < 2.0,
+                       "loaded record differs")
+        } else {
+            test.check("stack sidecar round trip preserves the fields", false, "record could not be loaded back")
+        }
+        
+        // a record with fewer than two selected files is not a valid stack
+        var single = record
+        single.output_file = dir.appendingPathComponent("single.dng").path
+        single.selected_files = ["/tmp/a.nef"]
+        try save_stack_record(single)
+        test.check("stack sidecar with < 2 selected files is rejected", load_stack_record(url: single.sidecar_url) == nil)
+        
+        // arbitrary json is rejected
+        test.check("non-stack json is rejected", load_stack_record(url: URL(fileURLWithPath: #file)) == nil)
+    } catch {
+        test.check("stack sidecar round trip", false, "\(error)")
+    }
+    
+    // ------------------------------------------------------------------
     print("")
     if test.failures == 0 {
         print("Selftest passed: all checks OK")

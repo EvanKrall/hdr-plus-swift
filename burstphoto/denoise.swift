@@ -10,6 +10,8 @@ enum AlignmentError: Error {
     case conversion_failed
     case missing_dng_converter
     case non_bayer_exposure_bracketing
+    case no_capture_timestamps
+    case no_bursts_found
 }
 
 
@@ -24,6 +26,10 @@ struct TileInfo {
     var n_pos_2d: Int
 }
 
+// progress units reported by perform_denoising() for one burst: conversion (10M) + loading
+// (10-20M) + align/merge (80M) + saving (10M); also used to display multi-burst progress
+let progress_units_per_burst = 110_000_000
+
 // class to store the progress of the align+merge
 class ProcessingProgress: ObservableObject {
     @Published var int = 0
@@ -32,6 +38,11 @@ class ProcessingProgress: ObservableObject {
     @Published var show_nonbayer_exposure_alert = false
     @Published var show_nonbayer_bit_depth_alert = false
     @Published var show_exposure_bit_depth_alert = false
+    /// total progress units expected for the whole job (defaults to a single burst; set to a
+    /// multiple of progress_units_per_burst when several bursts are processed automatically)
+    @Published var phase_total = progress_units_per_burst
+    /// optional prefix shown by the GUI while several bursts are processed (e.g. "Burst 2 of 5:")
+    @Published var status_line = ""
 }
 
 // set up Metal device
@@ -207,8 +218,11 @@ func load_and_prepare_burst(image_urls: [URL], progress: ProcessingProgress?, tm
 }
 
 
-/// Main function of the burst photo app.
-func perform_denoising(image_urls: [URL], progress: ProcessingProgress, merging_algorithm: String = "Fast", tile_size: String = "Medium", search_distance: String = "Medium", noise_reduction: Double = 13.0, exposure_control: String = "LinearFullRange", output_bit_depth: String = "Native", out_dir: String, tmp_dir: String) throws -> URL {
+/// Main function of the burst photo app. `initial_image_urls` are all files the user provided for
+/// the stack (before any frame was excluded or automatically rejected); it defaults to
+/// `image_urls` and is only recorded in the stack metadata sidecar. Returns the url of the saved
+/// image and the stack record that was persisted as a .json file next to it.
+func perform_denoising(image_urls: [URL], initial_image_urls: [URL]? = nil, progress: ProcessingProgress, merging_algorithm: String = "Fast", tile_size: String = "Medium", search_distance: String = "Medium", noise_reduction: Double = 13.0, exposure_control: String = "LinearFullRange", output_bit_depth: String = "Native", out_dir: String, tmp_dir: String) throws -> (out_url: URL, record: StackRecord) {
     
     // Maximum size for the caches
     let textureCacheMaxSizeMB: Double = min(10_000.0,
@@ -389,7 +403,26 @@ func perform_denoising(image_urls: [URL], progress: ProcessingProgress, merging_
     // Ensure the disk dng cache does not go above the set limit
     try trim_disk_cache(cache_dir: tmp_dir, to_max_size: maxDNGFolderSizeGB)
     
-    return out_url
+    // persist the stack metadata (input files, selected frames and the effective settings) as a
+    // .json file next to the output image, so the stack can be re-opened and re-merged later
+    let record = StackRecord(app_version: app_version_string(),
+                             created_at: Date(),
+                             output_file: out_url.path,
+                             initial_files: (initial_image_urls ?? image_urls).map { $0.path },
+                             selected_files: image_urls.map { $0.path },
+                             merging_algorithm: merging_algorithm,
+                             tile_size: tile_size,
+                             search_distance: search_distance,
+                             noise_reduction: noise_reduction,
+                             exposure_control: exposure_control,
+                             output_bit_depth: output_bit_depth)
+    do {
+        try save_stack_record(record)
+    } catch {
+        print("Warning: could not write stack metadata to \(record.sidecar_url.path): \(error)")
+    }
+    
+    return (out_url: out_url, record: record)
 }
 
 
@@ -404,6 +437,10 @@ func calculate_temporal_average(progress: ProcessingProgress, mosaic_pattern_wid
             exp_idx = comp_idx
         }
     }
+    
+    // (hoisted out of the progress closures below: a closure capturing `textures` would retain
+    // every input texture on the never-draining main queue of a CLI process — the CLI memory leak)
+    let progress_units_per_frame = Int(80_000_000/Double(textures.count))
     
     // if color_factor is NOT available, it is set to a negative value earlier in the pipeline
     if (white_level != -1 && black_level[0][0] != -1 && color_factors[0][0] > 0 && mosaic_pattern_width == 2) {
@@ -439,7 +476,7 @@ func calculate_temporal_average(progress: ProcessingProgress, mosaic_pattern_wid
             } else {
                 add_texture_exposure(comp_texture, final_texture, norm_texture, exposure_bias[comp_idx]-exposure_bias[exp_idx], white_level, black_level[comp_idx], color_factors[comp_idx], mosaic_pattern_width)
             }
-            DispatchQueue.main.async { progress.int += Int(80_000_000/Double(textures.count)) }
+            DispatchQueue.main.async { progress.int += progress_units_per_frame }
         }
      
         // 2. divide the sum of frames by a per-pixel norm to get the final image
@@ -451,7 +488,7 @@ func calculate_temporal_average(progress: ProcessingProgress, mosaic_pattern_wid
         for comp_idx in 0..<textures.count {
             let comp_texture = prepare_texture(textures[comp_idx], hotpixel_weight_texture, 0, 0, 0, 0, 0, black_level[comp_idx], mosaic_pattern_width)
             add_texture(comp_texture, final_texture, textures.count)
-            DispatchQueue.main.async { progress.int += Int(80_000_000/Double(textures.count)) }
+            DispatchQueue.main.async { progress.int += progress_units_per_frame }
         }
     }
 }

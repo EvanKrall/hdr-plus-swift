@@ -79,8 +79,10 @@ func convert_raws_to_dngs(_ in_urls: [URL], _ dng_converter_path: String, _ tmp_
         if !parallel_command.isEmpty {
             compute_queue.async(group: compute_group) {
                 do {
-                    try safeShell(command + parallel_command)
-                } catch {}
+                    _ = try safeShell(command + parallel_command)
+                } catch {
+                    print("Error: Adobe DNG Converter failed to launch: \(error)")
+                }
             }
         }
     }
@@ -96,6 +98,11 @@ func convert_raws_to_dngs(_ in_urls: [URL], _ dng_converter_path: String, _ tmp_
         let out_url = URL(fileURLWithPath: out_path)
         out_urls.append(out_url)
         if urls_needing_conversion.contains(url) && !FileManager.default.fileExists(atPath: out_path) {
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: out_path), let size = attributes[.size] as? Int, size == 0 {
+                print("Error: Adobe DNG Converter produced an empty file for " + url.lastPathComponent)
+            } else {
+                print("Error: Adobe DNG Converter did not convert " + url.lastPathComponent)
+            }
             throw AlignmentError.conversion_failed
         }
     }
@@ -307,6 +314,10 @@ func safeShell(_ command: String) throws -> String {
     
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     let output = String(data: data, encoding: .utf8)!
+    // reap the child process; without this, the shell (and its converter child) can remain a
+    // zombie, and zombies accumulate across the many conversions of a multi-burst run until no
+    // new process can be spawned
+    task.waitUntilExit()
     
     return output
 }

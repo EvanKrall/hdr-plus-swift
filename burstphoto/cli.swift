@@ -13,6 +13,19 @@ import MetalPerformanceShaders
 //            --search Small|Medium|Large       search distance for the alignment (default: Medium)
 //            --scale <px>                      manual color scale for the alignment field, in
 //                                              pyramid-level-0 pixels (default: auto = max |shift|)
+//   burstphoto-cli autoburst <path>... [opts]  automatic burst pipeline: split the given files
+//                                              and/or directories into bursts by EXIF capture
+//                                              time, reject frames that match the reference
+//                                              poorly and merge each remaining burst
+//     opts:  --gap <sec>                       maximum capture-time gap between successive frames
+//                                              of one burst (default: 1.0)
+//            --max-score <px>                  alignment score above which a frame is rejected
+//                                              (default: 10)
+//            --tile/--search                   alignment parameters (default: Medium)
+//            --nr <1-23>                       noise reduction strength (default: 13)
+//            --hq                              use the higher-quality merging algorithm
+//   burstphoto-cli stackinfo <file.json>...        print the contents of stack metadata files
+//                                              (as written next to every merged image)
 //   burstphoto-cli selftest                    run built-in verification tests of the alignment
 //                                              inspection pipeline (no input files needed)
 //   burstphoto-cli afinfo <file>                print the autofocus area parsed from a NEF's maker
@@ -40,6 +53,56 @@ struct MyProgram {
                 exit(1)
             }
             try run_inspection_cli(burst_dir: arguments[2], options: Array(arguments[3...]))
+            terminate_xmp_sdk()
+            return
+        }
+        
+        if arguments.count >= 2 && arguments[1] == "autoburst" {
+            guard arguments.count >= 3 else {
+                print("usage: burstphoto-cli autoburst <dir-or-file>... [--gap <sec>] [--max-score <px>] [--tile Small|Medium|Large] [--search Small|Medium|Large] [--nr <1-23>] [--hq]")
+                terminate_xmp_sdk()
+                exit(1)
+            }
+            try run_auto_burst_cli(arguments: Array(arguments[2...]))
+            terminate_xmp_sdk()
+            return
+        }
+        
+        if arguments.count >= 2 && arguments[1] == "stackinfo" {
+            guard arguments.count >= 3 else {
+                print("usage: burstphoto-cli stackinfo <file.json>...")
+                terminate_xmp_sdk()
+                exit(1)
+            }
+            var all_ok = true
+            for path in arguments[2...] {
+                if let record = load_stack_record(url: URL(fileURLWithPath: path)) {
+                    print("stack file:", path)
+                    print("  output:", record.output_file)
+                    print("  created:", record.created_at, "with Burst Photo", record.app_version)
+                    print("  initial:  \(record.initial_files.count) file(s)")
+                    print("  selected: \(record.selected_files.count) file(s)")
+                    for file in record.selected_files {
+                        print("    ", (file as NSString).lastPathComponent)
+                    }
+                    print("  settings: algorithm \(record.merging_algorithm), tile \(record.tile_size), search \(record.search_distance), noise reduction \(Int(record.noise_reduction)), exposure \(record.exposure_control), bit depth \(record.output_bit_depth)")
+                } else {
+                    print("could not read stack file:", path)
+                    all_ok = false
+                }
+            }
+            terminate_xmp_sdk()
+            if !all_ok { exit(1) }
+            return
+        }
+        
+        if arguments.count >= 2 && arguments[1] == "memtest" {
+            guard arguments.count >= 3 else {
+                print("usage: burstphoto-cli memtest <file1> [file2 ...]")
+                terminate_xmp_sdk()
+                exit(1)
+            }
+            run_memtest(urls: Array(arguments[2...]).map { URL(fileURLWithPath: $0) })
             terminate_xmp_sdk()
             return
         }
@@ -117,7 +180,7 @@ struct MyProgram {
             let output_bit_depth = "Native"
             
             // align+merge
-            let out_url = try perform_denoising(image_urls: image_urls, progress: progress, merging_algorithm: merging_algorithm, tile_size: tile_size, search_distance: search_distance, noise_reduction: noise_reduction, exposure_control: exposure_control, output_bit_depth: output_bit_depth, out_dir: out_dir, tmp_dir: tmp_dir)
+            let (out_url, _) = try perform_denoising(image_urls: image_urls, progress: progress, merging_algorithm: merging_algorithm, tile_size: tile_size, search_distance: search_distance, noise_reduction: noise_reduction, exposure_control: exposure_control, output_bit_depth: output_bit_depth, out_dir: out_dir, tmp_dir: tmp_dir)
            
             print("Image saved in:", out_url.relativePath)            
         }
@@ -126,6 +189,147 @@ struct MyProgram {
         try FileManager.default.removeItem(atPath: NSHomeDirectory() + "/Pictures/Burst Photo/.dngs/")
     }
     
+    
+    /// Memory leak bisection: repeat each pipeline stage in isolation and report the physical
+    /// footprint, so that a stage that retains memory across iterations can be identified.
+    static func run_memtest(urls: [URL]) {
+        let progress = ProcessingProgress()
+        let tmp_dir = NSHomeDirectory() + "/Pictures/Burst Photo/.dngs/"
+        try? FileManager.default.createDirectory(atPath: tmp_dir, withIntermediateDirectories: true)
+        
+        func report(_ label: String, _ pass: Int) {
+            print(String(format: "%@ pass %d: %.0f MB (gpu %.0f MB)", label, pass, current_memory_footprint_mb(), Double(device.currentAllocatedSize)/1e6))
+        }
+        
+        print("memtest with", urls.count, "image(s); footprint before:", String(format: "%.0f MB", current_memory_footprint_mb()))
+        
+        // phase 1: load only (includes DNG conversion if needed), per pass in an autorelease pool
+        for i in 0..<5 {
+            autoreleasepool {
+                _ = try? load_images(try! convert_raws_to_dngs(urls, "/Applications/Adobe DNG Converter.app", tmp_dir, NSCache<NSString, ImageCacheWrapper>()), textureCache: NSCache())
+            }
+            textureCache.removeAllObjects()
+            sleep(1)
+            report("load+pool", i)
+        }
+        
+        // phase 2a: load via the global texture cache (as the inspection/merge do), in an autorelease pool
+        for i in 0..<5 {
+            autoreleasepool {
+                _ = try? load_and_prepare_burst(image_urls: urls, progress: nil, tmp_dir: tmp_dir)
+            }
+            textureCache.removeAllObjects()
+            sleep(1)
+            report("load(cache)+pool", i)
+        }
+        
+        // phase 2: alignment inspection WITHOUT autorelease pool, with progress active
+        // (the progress closures used to capture the whole `textures` array and accumulate on the
+        // never-draining main queue; after the fix they capture only an Int)
+        for i in 0..<10 {
+            do {
+                let session = try perform_alignment_inspection(image_urls: urls, progress: progress, tmp_dir: tmp_dir)
+                _ = session  // keep the compiler from warning; the ref is dropped at the end of the loop
+            } catch {
+                print("memtest: inspection pass failed: \(error)")
+            }
+            textureCache.removeAllObjects()
+            sleep(1)
+            report("inspect-plain", i)
+        }
+        
+        // phase 2b: control — same inspection with progress: nil (no main-queue closures at all)
+        for i in 0..<10 {
+            do {
+                let session = try perform_alignment_inspection(image_urls: urls, progress: nil, tmp_dir: tmp_dir)
+                _ = session
+            } catch {
+                print("memtest: inspection pass failed: \(error)")
+            }
+            textureCache.removeAllObjects()
+            sleep(1)
+            report("inspect-nilprog", i)
+        }
+        
+        // phase 3: full align+merge, alternating noise_reduction to bypass the last_texture settings
+        // cache (otherwise every pass after the first would skip merging entirely); in an autorelease pool
+        let merge_out_dir = "/tmp/memtest_out"
+        try? FileManager.default.createDirectory(atPath: merge_out_dir, withIntermediateDirectories: true)
+        for i in 0..<4 {
+            let nr = 13.0 + Double(i % 2)
+            autoreleasepool {
+                do {
+                    _ = try perform_denoising(image_urls: urls, progress: progress, noise_reduction: nr, out_dir: merge_out_dir, tmp_dir: tmp_dir)
+                } catch {
+                    print("memtest: merge pass failed: \(error)")
+                }
+            }
+            textureCache.removeAllObjects()
+            sleep(1)
+            report("merge+pool(nr\(Int(nr)))", i)
+        }
+    }
+    
+    /// Automatic burst pipeline on the command line: detect bursts among the given files and/or
+    /// directories, reject poorly matching frames and merge each remaining burst.
+    static func run_auto_burst_cli(arguments: [String]) throws {
+        
+        // parse options
+        var paths: [String] = []
+        var max_gap = auto_burst_max_gap
+        var max_score = auto_burst_max_alignment_score
+        var tile_size = "Medium"
+        var search_distance = "Medium"
+        var noise_reduction = 13.0
+        var merging_algorithm = "Fast"
+        let exposure_control = "LinearFullRange"
+        let output_bit_depth = "Native"
+        var i = 0
+        while i < arguments.count {
+            switch arguments[i] {
+            case "--gap":
+                i += 1; max_gap = Double(arguments[i]) ?? max_gap
+            case "--max-score":
+                i += 1; max_score = Float(arguments[i]) ?? max_score
+            case "--tile":
+                i += 1; tile_size = arguments[i]
+            case "--search":
+                i += 1; search_distance = arguments[i]
+            case "--nr":
+                i += 1; noise_reduction = Double(arguments[i]) ?? noise_reduction
+            case "--hq":
+                merging_algorithm = "Higher quality"
+            default:
+                paths.append(arguments[i])
+            }
+            i += 1
+        }
+        guard !paths.isEmpty else { print("error: no input paths"); exit(1) }
+        guard tile_size_dict[tile_size] != nil else { print("invalid --tile value"); exit(1) }
+        guard search_distance_dict[search_distance] != nil else { print("invalid --search value"); exit(1) }
+        
+        // create output directory
+        let out_dir = NSHomeDirectory() + "/Pictures/Burst Photo/"
+        if !FileManager.default.fileExists(atPath: out_dir) {
+            try FileManager.default.createDirectory(atPath: out_dir, withIntermediateDirectories: true, attributes: nil)
+        }
+        let tmp_dir = out_dir + ".dngs/"
+        try FileManager.default.createDirectory(atPath: tmp_dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp_dir) }
+        
+        let progress = ProcessingProgress()
+        let urls = paths.map { URL(fileURLWithPath: $0) }
+        let result = try perform_auto_burst_processing(all_urls: urls, progress: progress, merging_algorithm: merging_algorithm, tile_size: tile_size, search_distance: search_distance, noise_reduction: noise_reduction, exposure_control: exposure_control, output_bit_depth: output_bit_depth, out_dir: out_dir, tmp_dir: tmp_dir, max_gap: max_gap, max_alignment_score: max_score)
+        
+        print("")
+        print("Summary:", result.summary)
+        if !result.merged_urls.isEmpty {
+            print("Saved images:")
+            for url in result.merged_urls {
+                print(" ", url.path)
+            }
+        }
+    }
     
     /// Alignment inspection mode: align all frames of a burst against the reference frame and export
     /// the alignment field and difference images as PNG files.
@@ -172,7 +376,6 @@ struct MyProgram {
         let fm = FileManager.default
         let burst_url = URL(fileURLWithPath: burst_dir)
         var image_urls = try fm.contentsOfDirectory(at: burst_url, includingPropertiesForKeys: [], options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants])
-        let raw_extensions = ["dng", "nef", "cr2", "cr3", "arw", "orf", "rw2", "raf"]
         image_urls = image_urls.filter{raw_extensions.contains($0.pathExtension.lowercased())}
         let dng_only = image_urls.filter{$0.pathExtension.lowercased() == "dng"}
         if !dng_only.isEmpty {

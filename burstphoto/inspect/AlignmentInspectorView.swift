@@ -26,7 +26,10 @@
  - The frame list supports checking/unchecking images (excluded from the merge), and multi-
    selection with cmd-click (toggle one) and shift-click (toggle a range). Checking/unchecking a
    row of a multi-selection applies to all selected rows.
- - Up/down arrow keys select the previous/next frame.
+ - Up/down arrow keys select the previous/next frame. While a key is held, the selection
+   advances IN LOCKSTEP with the preview: key repeats coalesce into a single pending step that
+   is applied when the in-flight render finishes, so the row highlight and the image move at
+   exactly the render speed (there is no backlog of frames for the preview to catch up on).
  */
 import SwiftUI
 import AppKit
@@ -56,20 +59,8 @@ struct AnchorPoint: Equatable {
 }
 
 
-/// A user-dragged rectangular "subject" area, as fractions of the frame (origin top-left). Used
-/// to score each frame by its similarity to the reference inside that area.
-struct RoiRect: Equatable {
-    var x0: CGFloat
-    var y0: CGFloat
-    var x1: CGFloat
-    var y1: CGFloat
-
-    func normalized() -> RoiRect {
-        RoiRect(x0: min(x0, x1), y0: min(y0, y1), x1: max(x0, x1), y1: max(y0, y1))
-    }
-
-    var is_degenerate: Bool { abs(x1 - x0) * abs(y1 - y0) < 0.0005 }
-}
+/// RoiRect (the subject-area rectangle) and af_subject_roi() live in inspect.swift so that both
+/// the inspector UI and the automatic burst pipeline (burst/autoburst.swift) can use them.
 
 
 /// Owns the inspection session and the inspector window. Shared between the main window
@@ -77,12 +68,20 @@ struct RoiRect: Equatable {
 final class InspectionCoordinator: ObservableObject {
     @Published var session: InspectionSession?
     var window: NSWindow?
-    /// Installed by ContentView: starts the regular merge for the given image urls.
-    var merge_handler: (([URL]) -> Void)?
+    /// Installed by ContentView: starts the regular merge for the given image urls — all frames of
+    /// the inspected burst (or, when a stack file was opened, the stack's recorded initial list)
+    /// plus the subset still checked by the user.
+    var merge_handler: (([URL], [URL]) -> Void)?
+    /// When the inspector was opened from a stack file (.json): the frames the stack initially
+    /// contained, and the subset that was NOT selected last time (initially unchecked).
+    var stack_initial_urls: [URL]? = nil
+    var initially_excluded_urls: Set<URL> = []
     
     /// Show the inspector window for the given session (reuses an existing window).
-    func show(session: InspectionSession) {
+    func show(session: InspectionSession, initial_urls: [URL]? = nil, initially_excluded_urls: Set<URL> = []) {
         self.session = session
+        self.stack_initial_urls = initial_urls
+        self.initially_excluded_urls = initially_excluded_urls
         if let window = window {
             window.makeKeyAndOrderFront(nil)
         } else {
@@ -103,6 +102,8 @@ final class InspectionCoordinator: ObservableObject {
     /// Hide the inspector window and release the session (frees the retained burst textures).
     func dismiss() {
         session = nil
+        stack_initial_urls = nil
+        initially_excluded_urls = []
         window?.orderOut(nil)
     }
 }
@@ -394,59 +395,22 @@ final class InspectorModel: ObservableObject {
         }
     }
     
-    /// Variation of the tile alignment field inside a rectangle (fractions, y from top): each
-    /// tile's shift is compared to the per-axis median shift of the region, combined to a
-    /// magnitude, and averaged over all tiles in the region (no outlier exclusion — the
-    /// worst-matching tiles are the signal). Only tiles fully inside the rectangle are used when
-    /// there are at least four of them (boundary tiles mix subject and background motion);
-    /// otherwise overlapping tiles are used. Returns the score in level-0 pixels (lower = more
-    /// rigid mapping to the reference); nil if the rectangle is smaller than a few tiles or the
-    /// frame has no alignment field.
+    /// Variation of the tile alignment field inside a rectangle (fractions, y from top), in
+    /// level-0 pixels. Computed by alignment_variation_in_roi() in inspect.swift (shared with
+    /// the automatic burst pipeline) from the cached alignment texels of this frame.
     func alignment_variation(idx: Int, roi: RoiRect) -> Float? {
         let frame = session.frames[idx]
         guard let alignment = frame.alignment_texture, let tile_info = frame.tile_info else { return nil }
-        let texels = alignment_texels(for: idx)
-        guard texels.count >= alignment.width * alignment.height * 2 else { return nil }
-        let n_tiles_x = alignment.width, n_tiles_y = alignment.height
-        // tile geometry: the alignment grid spans the PADDED frame at 1/downscale scale; tile ix
-        // centers at level-0 x = (ix + 1) * tile_size / 2 (see warp_texture_bayer). Frame pixels
-        // therefore map to level-0 pixels as (x + pad) / downscale.
-        let downscale = CGFloat(frame.downscale_factor)
-        let half_tile = CGFloat(tile_info.tile_size) / 2
-        let n = roi.normalized()
-        let x0 = (n.x0 * CGFloat(session.ref_texture_cropped.width) + CGFloat(session.pad_x)) / downscale
-        let x1 = (n.x1 * CGFloat(session.ref_texture_cropped.width) + CGFloat(session.pad_x)) / downscale
-        let y0 = (n.y0 * CGFloat(session.ref_texture_cropped.height) + CGFloat(session.pad_y)) / downscale
-        let y1 = (n.y1 * CGFloat(session.ref_texture_cropped.height) + CGFloat(session.pad_y)) / downscale
-        
-        var inner: [(Float, Float)] = []
-        var overlap: [(Float, Float)] = []
-        for ty in 0..<n_tiles_y {
-            let cy = (CGFloat(ty) + 1) * half_tile
-            for tx in 0..<n_tiles_x {
-                let cx = (CGFloat(tx) + 1) * half_tile
-                let i = (ty * n_tiles_x + tx) * 2
-                let shift = (Float(texels[i]), Float(texels[i + 1]))
-                if cx >= x0 + half_tile, cx <= x1 - half_tile, cy >= y0 + half_tile, cy <= y1 - half_tile {
-                    inner.append(shift)
-                } else if cx >= x0 - half_tile, cx <= x1 + half_tile, cy >= y0 - half_tile, cy <= y1 + half_tile {
-                    overlap.append(shift)
-                }
-            }
-        }
-        let tiles = inner.count >= 4 ? inner : overlap
-        guard tiles.count >= 4 else { return nil }
-        
-        // robust center: per-axis median shift, then mean per-tile deviation magnitude (the
-        // median only makes the measure translation-invariant — no tiles are excluded)
-        let med_x = Float(median_of_sorted(tiles.map { Double($0.0) }.sorted()))
-        let med_y = Float(median_of_sorted(tiles.map { Double($0.1) }.sorted()))
-        var sum = 0.0
-        for shift in tiles {
-            let dx = shift.0 - med_x, dy = shift.1 - med_y
-            sum += Double(sqrt(dx * dx + dy * dy))
-        }
-        return Float(sum / Double(tiles.count))
+        return alignment_variation_in_roi(texels: alignment_texels(for: idx),
+                                          alignment_width: alignment.width,
+                                          alignment_height: alignment.height,
+                                          tile_size: tile_info.tile_size,
+                                          downscale_factor: frame.downscale_factor,
+                                          roi: roi,
+                                          frame_width: session.ref_texture_cropped.width,
+                                          frame_height: session.ref_texture_cropped.height,
+                                          pad_x: session.pad_x,
+                                          pad_y: session.pad_y)
     }
     
     /// The alignment texels of one frame (cached readback of the small tile-grid texture).
@@ -651,14 +615,6 @@ final class InspectorModel: ObservableObject {
 }
 
 
-/// Median of an already sorted array.
-private func median_of_sorted(_ values: [Double]) -> Double {
-    if values.isEmpty { return 1.0 }
-    let mid = values.count / 2
-    return values.count % 2 == 1 ? values[mid] : 0.5 * (values[mid - 1] + values[mid])
-}
-
-
 struct AlignmentInspectorView: View {
     @ObservedObject var coordinator: InspectionCoordinator
     
@@ -720,6 +676,9 @@ private struct InspectorContentView: View {
     @State private var rendering = false
     @State private var render_queue: [RenderRequest] = []
     @State private var render_busy = false
+    /// Coalesced arrow-key scrub step: at most one pending selection move while a render is in
+    /// flight, applied when that render finishes (keeps selection and preview in lockstep).
+    @State private var pending_moves = 0
     @State private var last_queued_params: RenderParams?
     @State private var last_thumb_params = ""
     @State private var zoom: CGFloat = 1
@@ -734,6 +693,8 @@ private struct InspectorContentView: View {
         _selected_idx = State(initialValue: initial)
         _selection = State(initialValue: [initial])
         _last_clicked = State(initialValue: initial)
+        // when a stack file was opened, frames that were not selected last time start unchecked
+        _excluded = State(initialValue: Set(session.frames.filter { coordinator.initially_excluded_urls.contains($0.url) }.map { $0.index }))
         let default_roi = InspectorContentView.subject_default_roi(session: session)
         _roi = State(initialValue: default_roi)
         // anchor starts at the subject-area midpoint (still automatic; a manual click or
@@ -753,17 +714,10 @@ private struct InspectorContentView: View {
     }
     
     /// Default subject area: the reference frame's autofocus point (from the Nikon AFInfo2 maker
-    /// notes), doubled around its center to form a usable scoring region. Nil if the camera
-    /// recorded no AF position.
+    /// notes), doubled around its center to form a usable scoring region (see af_subject_roi in
+    /// inspect.swift). Nil if the camera recorded no AF position.
     private static func subject_default_roi(session: InspectionSession) -> RoiRect? {
-        guard let af = session.af_area, af.image_width > 0, af.image_height > 0 else { return nil }
-        let image_w = CGFloat(af.image_width), image_h = CGFloat(af.image_height)
-        let cx = CGFloat(af.x) / image_w
-        let cy = CGFloat(af.y) / image_h
-        let extent_w = max(CGFloat(af.width) / image_w * 2.0, 0.04)  // 2x the AF area, min 4% of frame
-        let extent_h = max(CGFloat(af.height) / image_h * 2.0, 0.04)
-        return RoiRect(x0: max(0, cx - extent_w / 2), y0: max(0, cy - extent_h / 2),
-                       x1: min(1, cx + extent_w / 2), y1: min(1, cy + extent_h / 2))
+        return af_subject_roi(session: session)
     }
     
     var selected_frame: InspectionFrame { session.frames[selected_idx] }
@@ -1139,10 +1093,12 @@ private struct InspectorContentView: View {
             Spacer()
             Button(action: {
                 guard let handler = coordinator.merge_handler, let session = coordinator.session else { return }
-                let urls = session.frames.filter { !excluded.contains($0.index) }.map { $0.url }
+                // when a stack file was opened, keep the stack's recorded initial frame list
+                let initial_urls = coordinator.stack_initial_urls ?? session.frames.map { $0.url }
+                let selected_urls = session.frames.filter { !excluded.contains($0.index) }.map { $0.url }
                 coordinator.dismiss()
                 // let the inspection view (and its burst textures) be released before the merge reloads everything
-                DispatchQueue.main.async { handler(urls) }
+                DispatchQueue.main.async { handler(initial_urls, selected_urls) }
             }, label: {
                 Text("Merge into image")
             })
@@ -1173,11 +1129,7 @@ private struct InspectorContentView: View {
         }
         guard event.keyCode == 125 || event.keyCode == 126 || event.keyCode == 123 || event.keyCode == 124 || event.keyCode == 49 else { return event }
         if event.type == .keyUp {
-            // released the up/down arrow: stop scrubbing right where the selection ended
-            if event.keyCode == 125 || event.keyCode == 126 {
-                cancel_scrub()
-            }
-            return nil
+            return nil  // nothing to cancel: scrub steps coalesce while a render is in flight
         }
         if event.keyCode == 49 {
             // space: check/uncheck the current image (guard against key auto-repeat)
@@ -1187,8 +1139,8 @@ private struct InspectorContentView: View {
             return nil
         }
         switch event.keyCode {
-        case 125: move_selection(+1)   // down arrow
-        case 126: move_selection(-1)   // up arrow
+        case 125: request_selection_move(+1)   // down arrow
+        case 126: request_selection_move(-1)   // up arrow
         case 123: move_mode(-1)        // left arrow: previous tab
         case 124: move_mode(+1)        // right arrow: next tab
         default: break
@@ -1205,28 +1157,32 @@ private struct InspectorContentView: View {
         }
     }
     
-    /// Called when the arrow key is released: drop all queued scrub frames (the in-flight render
-    /// still finishes) and queue a single render of the frame the selection ended at, so the view
-    /// converges on it.
-    private func cancel_scrub() {
-        render_queue.removeAll()
-        if render_busy, let params = last_queued_params {
-            render_queue = [RenderRequest(idx: selected_idx, params: params)]
+    /// One arrow-key scrub step. If a render is in flight, the step only coalesces into
+    /// `pending_moves` and is applied when that render finishes (see pump_renders), so the
+    /// selection cannot run ahead of the preview: both advance at exactly the render speed.
+    private func request_selection_move(_ delta: Int) {
+        guard render_busy else {
+            apply_selection_move(delta)
+            return
         }
-        pump_renders()
+        pending_moves = delta
     }
     
-    private func move_selection(_ delta: Int) {
+    /// Move the selection one step within the visible order. Returns whether it moved.
+    @discardableResult
+    private func apply_selection_move(_ delta: Int) -> Bool {
         // follow the VISIBLE order (capture order, or score-sorted) rather than frame indices
         let order = display_indices
-        guard let position = order.firstIndex(of: selected_idx) else { return }
+        guard let position = order.firstIndex(of: selected_idx) else { return false }
         let next = order[min(max(position + delta, 0), order.count - 1)]
         if next != selected_idx {
             selected_idx = next
             selection = [next]
             last_clicked = next
             list_proxy?.scrollTo(next, anchor: .center)
+            return true
         }
+        return false
     }
     
     // MARK: rendering
@@ -1243,9 +1199,9 @@ private struct InspectorContentView: View {
             match_exposure: match_exposure)
         let request = RenderRequest(idx: selected_idx, params: params)
         
-        // a parameter change (mode, gain, anchor, ...) invalidates everything queued so far, so that
-        // control changes respond instantly even while a long scrub backlog is draining; repeated
-        // identical requests (e.g. key repeats on the same frame) are coalesced
+        // a parameter change (mode, gain, anchor, ...) invalidates the queued request so that
+        // control changes respond instantly even while a render is in flight; repeated identical
+        // requests are coalesced
         if params != last_queued_params {
             render_queue.removeAll()
             last_queued_params = params
@@ -1259,9 +1215,10 @@ private struct InspectorContentView: View {
         pump_renders()
     }
     
-    /// Render queued requests one at a time, IN ORDER, and publish every result. Holding the
-    /// arrow keys therefore shows every intermediate frame while scrubbing (at the render speed
-    /// of the selected mode), instead of skipping straight to the final frame.
+    /// Render queued requests one at a time, IN ORDER, and publish every result. Arrow-key scrub
+    /// steps do NOT queue renders: while a render is in flight they coalesce into pending_moves,
+    /// and exactly one coalesced step is applied here when the render finishes, so the selected
+    /// row and the preview stay IN LOCKSTEP while scrubbing (both move at the render speed).
     private func pump_renders() {
         guard !render_busy, let request = render_queue.first else { return }
         render_busy = true
@@ -1288,7 +1245,15 @@ private struct InspectorContentView: View {
                     self.rendered = image
                     self.rendered_info = result.info
                     self.render_busy = false
-                    self.rendering = !self.render_queue.isEmpty
+                    var more = !self.render_queue.isEmpty
+                    if self.pending_moves != 0 {
+                        let delta = self.pending_moves
+                        self.pending_moves = 0
+                        // the selection change makes SwiftUI schedule the next scrub render
+                        // (onChange of selected_idx); a step at the end of the list is a no-op
+                        more = self.apply_selection_move(delta) || more
+                    }
+                    self.rendering = more
                     self.pump_renders()
                 }
             }
